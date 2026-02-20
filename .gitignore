@@ -3,6 +3,7 @@ node_modules/
 
 # Build artifacts
 *.vsix
+antigravity-auto-accept-*.vsix
 
 # OS files
 .DS_Store

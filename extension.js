@@ -11,11 +11,22 @@ let statusBarItem;
 let retryStatusBarItem;
 let lastRetryAttempt = 0;
 let outputChannel;
+let cdpConnected = false; // Track if the port is actually open
+let isInternalExecuting = false; // Flag to prevent command spy from logging our own loop
+
 
 function activate(context) {
+    console.log('[Antigravity Auto-Accept 🚀] Plugin is ACTIVATING...');
+
     // Create output channel for logging
     outputChannel = vscode.window.createOutputChannel('Antigravity Auto-Accept');
     context.subscriptions.push(outputChannel);
+
+    // Watch for settings changes...
+    hookVSCodeCommands(); // Start the smart spy
+    // listAllInterestingCommands(); // Discover all available commands
+
+
 
     // Load settings
     loadSettings();
@@ -154,6 +165,7 @@ function activate(context) {
 
     // Start the loop
     startLoop();
+    console.log('[Antigravity Auto-Accept 🚀] Plugin ACTIVATED and Loop started!');
 }
 
 function loadSettings() {
@@ -162,6 +174,63 @@ function loadSettings() {
     autoRetryEnabled = config.get('autoRetryEnabled', true);
     retryMaxCount = config.get('retryMaxCount', 10);
 }
+
+/**
+ * Smart Spy: Intercepts commands but ignores our own automated calls
+ */
+function hookVSCodeCommands() {
+    const originalExecute = vscode.commands.executeCommand;
+    vscode.commands.executeCommand = function (command, ...args) {
+        // Only log if it's NOT our internal loop and it's a related command
+        if (!isInternalExecuting) {
+            const cmdLower = command.toLowerCase();
+            const isInteresting = cmdLower.includes('antigravity') || cmdLower.includes('agent') || cmdLower.includes('cockpit');
+
+            if (isInteresting && outputChannel) {
+                outputChannel.appendLine(`[SPY] SYSTEM Triggered: ${command}`);
+                console.log(`[Antigravity Auto-Accept 🚀] [SPY] Intercepted external call: ${command}`);
+            }
+        }
+        return originalExecute.apply(this, [command, ...args]);
+    };
+}
+
+/**
+ * ดึงรายชื่อคำสั่งทั้งหมดที่มีอยู่จริงใน VS Code (ทุกปลั๊กอิน) ออกมาตรวจสอบ
+ */
+async function listAllInterestingCommands() {
+    try {
+        const allCommands = await vscode.commands.getCommands(true);
+
+        // กรองคำสั่งที่ไม่ใช่ของ VS Code เอง
+        const pluginCommands = allCommands.filter(cmd =>
+            !cmd.startsWith('vscode.') &&
+            !cmd.startsWith('unlimited.')
+        ).sort();
+
+        if (outputChannel) {
+            outputChannel.appendLine(`\n====================================================`);
+            outputChannel.appendLine(`🔎 COMMAND DISCOVERY REPORT (Found: ${allCommands.length} total)`);
+            outputChannel.appendLine(`====================================================`);
+
+            outputChannel.appendLine(`\n[!] NON-VSCODE COMMANDS (${pluginCommands.length}):`);
+            pluginCommands.forEach(cmd => {
+                // เน้นสีคำที่น่าจะเกี่ยวกับเรา
+                const isVeryInteresting = ['agent', 'anti', 'gravity', 'accept', 'allow', 'confirm', 'step', 'cockpit'].some(w => cmd.toLowerCase().includes(w));
+                const prefix = isVeryInteresting ? ' ⭐ ' : '  - ';
+                outputChannel.appendLine(`${prefix}${cmd}`);
+            });
+
+            outputChannel.appendLine(`\n====================================================\n`);
+        }
+
+        console.log(`[Antigravity Auto-Accept 🚀] Discovery finished. Found ${pluginCommands.length} plugin commands.`);
+    } catch (e) {
+        console.error('Failed to list commands', e);
+    }
+}
+
+
 
 function updateStatusBar() {
     if (!statusBarItem) return;
@@ -182,11 +251,17 @@ function updateRetryStatusBar() {
 
     if (autoRetryEnabled) {
         const countInfo = retryMaxCount === 0 ? '∞' : `${retryCurrentCount}/${retryMaxCount}`;
-        retryStatusBarItem.text = `✅ Auto-Retry: ON (${cdpPort}) [${countInfo}]`;
-        retryStatusBarItem.tooltip = `Auto-Retry via CDP is Enabled\nPort: ${cdpPort}\nRetry Count: ${countInfo}\nClick to Disable`;
 
-        // Show warning if approaching or at limit
-        if (retryMaxCount > 0 && retryCurrentCount >= retryMaxCount) {
+        let statusPrefix = cdpConnected ? '✅' : '⚠️';
+        let tooltipWarning = cdpConnected ? '' : `\n\n⚠️ CDP WARNING: Port ${cdpPort} appears closed or unreachable!\nMake sure VS Code was started with --remote-debugging-port=${cdpPort}`;
+
+        retryStatusBarItem.text = `${statusPrefix} Auto-Retry: ON (${cdpPort}) [${countInfo}]`;
+        retryStatusBarItem.tooltip = `Auto-Retry via CDP is Enabled\nPort: ${cdpPort}\nRetry Count: ${countInfo}${tooltipWarning}\nClick to Disable`;
+
+        // Show warning if disconnected or approaching limit
+        if (!cdpConnected) {
+            retryStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        } else if (retryMaxCount > 0 && retryCurrentCount >= retryMaxCount) {
             retryStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
         } else {
             retryStatusBarItem.backgroundColor = undefined;
@@ -369,6 +444,12 @@ async function clickRetryViaCDP() {
     try {
         const targets = await getCDPTargets();
 
+        if (!cdpConnected) {
+            cdpConnected = true;
+            updateRetryStatusBar();
+            outputChannel.appendLine(`[${new Date().toLocaleTimeString()}] 🔌 CDP Connection Established/Restored on port ${cdpPort}`);
+        }
+
         // Find Antigravity Agent panel or relevant webview
         const potentialTargets = targets.filter(t =>
             t.type === 'page' || t.type === 'webview' ||
@@ -383,18 +464,43 @@ async function clickRetryViaCDP() {
             ))
         );
 
+        if (potentialTargets.length > 0) {
+            //outputChannel.appendLine(`[${new Date().toLocaleTimeString()}] [DETECTION] Found ${potentialTargets.length} potential Antigravity windows. Scanning for dialogs...`);
+            //console.log(`[Antigravity Auto-Accept 🚀] [DETECTION] Found ${potentialTargets.length} potential Antigravity windows. Scanning for dialogs...`);
+        }
+
         // JavaScript to find and click Retry button (including inside iframes)
         const clickRetryScript = `
             (function() {
-                // Helper function to find and click Retry button in a document
-                function findAndClickRetry(doc, location) {
+                // Helper function to find and click action buttons in a document
+                function findAndClickAction(doc, location) {
                     try {
-                        const buttons = doc.querySelectorAll('button');
+                        // Priority 1: Search specifically inside #conversation if it exists
+                        const conversation = doc.querySelector('#conversation');
+                        const searchRoot = conversation || doc;
+                        
+                        const buttons = searchRoot.querySelectorAll('button');
+                        const targets = ['Retry', 'Run', 'Accept', 'Allow', 'Confirm', 'Yes', 'Continue', 'Approve'];
+                        
                         for (const btn of buttons) {
-                            const text = btn.textContent ? btn.textContent.trim() : '';
-                            if (text === 'Retry' && !btn.disabled && btn.offsetParent !== null) {
+                            if (btn.disabled || btn.offsetParent === null) continue;
+                            
+                            const text = btn.textContent ? btn.textContent.trim().toLowerCase() : '';
+                            
+                            // Check for various action words
+                            const matched = targets.find(t => {
+                                const targetLow = t.toLowerCase();
+                                // Match if exact, or starts with target followed by space/shortcut
+                                return text === targetLow || 
+                                       text.startsWith(targetLow + ' ') || 
+                                       text.startsWith(targetLow + '\\n') ||
+                                       text.startsWith(targetLow + 'alt') ||
+                                       text.startsWith(targetLow + 'ctrl');
+                            });
+
+                            if (matched) {
                                 btn.click();
-                                return 'clicked_' + location;
+                                return 'clicked_' + location + '_' + matched;
                             }
                         }
                     } catch (e) {
@@ -404,7 +510,7 @@ async function clickRetryViaCDP() {
                 }
                 
                 // Try main document first
-                let result = findAndClickRetry(document, 'main');
+                let result = findAndClickAction(document, 'main');
                 if (result) return result;
                 
                 // Try all iframes (where Antigravity Agent panel lives)
@@ -414,7 +520,7 @@ async function clickRetryViaCDP() {
                         const iframe = iframes[i];
                         const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
                         if (iframeDoc) {
-                            result = findAndClickRetry(iframeDoc, 'iframe_' + i);
+                            result = findAndClickAction(iframeDoc, 'iframe_' + i);
                             if (result) return result;
                         }
                     } catch (e) {
@@ -435,9 +541,13 @@ async function clickRetryViaCDP() {
                     if (value && typeof value === 'string' && value.startsWith('clicked_')) {
                         retryCurrentCount++;
                         const timestamp = new Date().toLocaleTimeString();
-                        const location = value.replace('clicked_', '');
+                        
+                        const parts = value.split('_');
+                        const location = parts[1];
+                        const action = parts[2] || 'Action';
+                        
                         const countInfo = retryMaxCount === 0 ? retryCurrentCount : `${retryCurrentCount}/${retryMaxCount}`;
-                        outputChannel.appendLine(`[${timestamp}] ✅ Retry #${countInfo} clicked via CDP (target: ${target.title || target.url}, location: ${location})`);
+                        outputChannel.appendLine(`[${timestamp}] ✅ ${action} #${countInfo} clicked via CDP (target: ${target.title || target.url}, location: ${location})`);
                         outputChannel.show(true);  // Show output channel, preserve focus
                         updateRetryStatusBar(); // Update status bar with new count
                         return;
@@ -449,6 +559,11 @@ async function clickRetryViaCDP() {
         }
     } catch (e) {
         // CDP not available or error, silent fail
+        if (cdpConnected) {
+            cdpConnected = false;
+            updateRetryStatusBar();
+            outputChannel.appendLine(`[${new Date().toLocaleTimeString()}] ❌ CDP Connection Failed on port ${cdpPort}. Is VS Code started with --remote-debugging-port?`);
+        }
     }
 }
 
@@ -456,56 +571,41 @@ function startLoop() {
     autoAcceptInterval = setInterval(async () => {
         if (!enabled) return;
 
-        // ========== AUTO-ACCEPT AGENT STEPS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.acceptAgentStep');
-        } catch (e) { }
+        // Set flag to true so our spy doesn't log these
+        isInternalExecuting = true;
 
-        // ========== AUTO-ACCEPT TERMINAL COMMANDS ==========
         try {
-            await vscode.commands.executeCommand('antigravity.terminal.accept');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.terminalCommand.accept');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.command.accept');
-        } catch (e) { }
+            // ========== AUTO-ACCEPT AGENT STEPS ==========
+            await vscode.commands.executeCommand('antigravity.agent.acceptAgentStep').catch(() => { });
 
-        // ========== AUTO-CONFIRM STEP EXECUTION ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.confirmStep');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.confirm');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.confirm');
-        } catch (e) { }
+            // ========== AUTO-ACCEPT TERMINAL COMMANDS ==========
+            await vscode.commands.executeCommand('antigravity.terminal.accept').catch(() => { });
+            await vscode.commands.executeCommand('antigravity.terminalCommand.accept').catch(() => { });
+            await vscode.commands.executeCommand('antigravity.command.accept').catch(() => { });
 
-        // ========== AUTO-ALLOW PERMISSIONS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.allowOnce');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.allowConversation');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.allowOnce');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.allowConversation');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.allow');
-        } catch (e) { }
+            // ========== AUTO-CONFIRM STEP EXECUTION ==========
+            await vscode.commands.executeCommand('antigravity.agent.confirmStep').catch(() => { });
+            await vscode.commands.executeCommand('agCockpit.confirm').catch(() => { });
+            await vscode.commands.executeCommand('antigravity.confirm').catch(() => { });
 
-        // ========== AUTO-RETRY VIA CDP ==========
-        if (autoRetryEnabled) {
-            await clickRetryViaCDP();
+            // ========== AUTO-ALLOW PERMISSIONS ==========
+            await vscode.commands.executeCommand('antigravity.agent.allowOnce').catch(() => { });
+            await vscode.commands.executeCommand('antigravity.agent.allowConversation').catch(() => { });
+            await vscode.commands.executeCommand('agCockpit.allowOnce').catch(() => { });
+            await vscode.commands.executeCommand('agCockpit.allowConversation').catch(() => { });
+            await vscode.commands.executeCommand('antigravity.allow').catch(() => { });
+
+            // ========== AUTO-RETRY VIA CDP ==========
+            if (autoRetryEnabled) {
+                await clickRetryViaCDP();
+            }
+        } finally {
+            // Unset flag after all commands finished
+            isInternalExecuting = false;
         }
     }, 500);
 }
+
 
 function deactivate() {
     if (autoAcceptInterval) {
