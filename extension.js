@@ -450,7 +450,7 @@ async function clickRetryViaCDP() {
             outputChannel.appendLine(`[${new Date().toLocaleTimeString()}] 🔌 CDP Connection Established/Restored on port ${cdpPort}`);
         }
 
-        // Find Antigravity Agent panel or relevant webview
+        // Broad first pass: any page or webview that could be the agent panel
         const potentialTargets = targets.filter(t =>
             t.type === 'page' || t.type === 'webview' ||
             (t.title && (
@@ -475,9 +475,11 @@ async function clickRetryViaCDP() {
                 // Helper function to find and click action buttons in a document
                 function findAndClickAction(doc, location) {
                     try {
-                        // Priority 1: Search specifically inside #conversation if it exists
-                        const conversation = doc.querySelector('#conversation');
-                        const searchRoot = conversation || doc;
+                        // Strictly require #conversation container - no ID, no action.
+                        const conversation = doc.getElementById('conversation') || doc.querySelector('[id^="conversation-"]');
+                        if (!conversation) return null;
+                        
+                        const searchRoot = conversation;
                         
                         const buttons = searchRoot.querySelectorAll('button');
                         const targets = ['Retry', 'Run', 'Accept', 'Allow', 'Confirm', 'Yes', 'Continue', 'Approve'];
@@ -500,7 +502,8 @@ async function clickRetryViaCDP() {
 
                             if (matched) {
                                 btn.click();
-                                return 'clicked_' + location + '_' + matched;
+                                const convoId = conversation ? conversation.id : 'conversation';
+                                return 'clicked_' + location + '_' + matched + '_' + convoId;
                             }
                         }
                     } catch (e) {
@@ -532,22 +535,31 @@ async function clickRetryViaCDP() {
             })();
         `;
 
+        // Second pass: check each target for #conversation before attempting clicks
+        const hasConversationScript = `(function() { return !!(document.getElementById('conversation') || document.querySelector('[id^="conversation-"]')); })();`;
+
         for (const target of potentialTargets) {
             if (target.webSocketDebuggerUrl) {
                 try {
+                    // Gate: skip this target if it has no #conversation element
+                    const checkResult = await executeScriptInTarget(target.webSocketDebuggerUrl, hasConversationScript);
+                    const hasConvo = checkResult?.result?.result?.value || checkResult?.result?.value;
+                    if (!hasConvo) continue;
+
                     const result = await executeScriptInTarget(target.webSocketDebuggerUrl, clickRetryScript);
                     // CDP returns nested structure: result.result.result.value
                     const value = result?.result?.result?.value || result?.result?.value;
                     if (value && typeof value === 'string' && value.startsWith('clicked_')) {
                         retryCurrentCount++;
                         const timestamp = new Date().toLocaleTimeString();
-                        
+
                         const parts = value.split('_');
                         const location = parts[1];
                         const action = parts[2] || 'Action';
-                        
+                        const convoId = parts[3] || 'unknown';
+
                         const countInfo = retryMaxCount === 0 ? retryCurrentCount : `${retryCurrentCount}/${retryMaxCount}`;
-                        outputChannel.appendLine(`[${timestamp}] ✅ ${action} #${countInfo} clicked via CDP (target: ${target.title || target.url}, location: ${location})`);
+                        outputChannel.appendLine(`[${timestamp}] ✅ ${action} #${countInfo} clicked via CDP (target: ${target.title || target.url}, location: ${location}, convo: ${convoId})`);
                         outputChannel.show(true);  // Show output channel, preserve focus
                         updateRetryStatusBar(); // Update status bar with new count
                         return;
